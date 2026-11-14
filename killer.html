@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Escape From The Killer</title>
+<style>
+  html,body{margin:0;height:100%;background:#07070b;color:#eee;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;overflow:hidden;
+    user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
+  #hud{height:44px;display:flex;align-items:center;justify-content:space-between;padding:0 16px;box-sizing:border-box;
+    font-weight:800;letter-spacing:1px;font-size:15px;color:#d33;text-shadow:0 0 8px #800}
+  #hud span:last-child{color:#ddd;text-shadow:none}
+  #stage{position:absolute;top:44px;left:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center}
+  canvas{display:block;touch-action:none;cursor:grab;background:#0c0c12}
+  canvas:active{cursor:grabbing}
+  #ov{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;
+    background:rgba(5,0,0,.82);text-align:center;padding:24px;z-index:5}
+  #ov.hidden{display:none}
+  #ov h1{margin:0;font-size:clamp(28px,7vw,52px);color:#e11d2e;text-shadow:0 0 18px #a00;letter-spacing:2px}
+  #ov p{margin:0;max-width:420px;line-height:1.5;color:#ccc}
+  #ov small{color:#e8a33a;max-width:420px}
+  #btn{margin-top:8px;padding:14px 34px;font-size:18px;font-weight:800;border:0;border-radius:10px;background:#c1121f;color:#fff;
+    box-shadow:0 0 18px #c1121f88;cursor:pointer}
+  #btn:active{transform:scale(.96)}
+</style>
+</head>
+<body>
+<div id="hud"><span id="lvl">LEVEL 1</span><span id="tm">0.0 d</span></div>
+<div id="stage"><canvas id="c"></canvas></div>
+<div id="ov">
+  <h1>ESCAPE FROM THE KILLER</h1>
+  <p id="msg">Seret pemain dengan mouse atau jari (atau pakai panah / WASD) menuju pintu hijau. Jangan sampai tertangkap anjing pembunuh!</p>
+  <small id="warn"></small>
+  <button id="btn">MULAI</button>
+</div>
+
+<script>
+(() => {
+  const CELL = 40;
+  const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+  const ov = document.getElementById('ov'), btn = document.getElementById('btn');
+  const msg = document.getElementById('msg'), warn = document.getElementById('warn');
+  const lvlEl = document.getElementById('lvl'), tmEl = document.getElementById('tm');
+
+  // ---------- Gambar anjing (tetap, tidak bisa diganti dari dalam game) ----------
+  const img = new Image();
+  let imgOK = false;
+  img.onload = () => { imgOK = img.naturalWidth > 0; updateWarn(); };
+  img.onerror = () => { imgOK = false; updateWarn(); };
+  img.src = 'anjing.png';
+  function updateWarn() {
+    warn.textContent = imgOK ? '' : '⚠ anjing.png tidak ditemukan, memakai gambar sementara. Taruh anjing.png di folder yang sama dengan file ini.';
+  }
+  updateWarn();
+
+  // ---------- State ----------
+  let cols, rows, W, H, walls, rects, cache, scale = 1, dpr = 1;
+  let level = 1, state = 'ready', time = 0, startDelay = 0, loseT = 0, hbPhase = 0, prevP = 0, repathT = 0;
+  let player, dog, distMap = null;
+  let pointer = null, dragOff = null, dragging = false;
+  const keys = {};
+
+  const WALL_T = 6;
+  const DIRS = [[0,-1,0,2],[1,0,1,3],[0,1,2,0],[-1,0,3,1]]; // dx,dy,wall idx,opposite idx
+
+  // ---------- Audio ----------
+  let actx = null;
+  function thump(v) {
+    if (!actx) return;
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = 'sine'; o.frequency.setValueAtTime(75 * v + 20, actx.currentTime);
+    o.frequency.exponentialRampToValueAtTime(35, actx.currentTime + 0.15);
+    g.gain.setValueAtTime(0.28 * v, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + 0.18);
+    o.connect(g).connect(actx.destination); o.start(); o.stop(actx.currentTime + 0.2);
+  }
+
+  // ---------- Level ----------
+  function setupLevel() {
+    const n = Math.min(9 + level, 16);
+    const aw = innerWidth, ah = innerHeight - 44;
+    if (aw >= ah) { rows = n; cols = Math.min(40, Math.max(n, Math.round(n * aw / ah))); }
+    else { cols = n; rows = Math.min(40, Math.max(n, Math.round(n * ah / aw))); }
+    W = cols * CELL; H = rows * CELL;
+
+    walls = Array.from({length: rows}, () => Array.from({length: cols}, () => [1,1,1,1]));
+    const vis = Array.from({length: rows}, () => Array(cols).fill(0));
+    const stack = [[0,0]]; vis[0][0] = 1;
+    while (stack.length) {
+      const [x, y] = stack[stack.length - 1];
+      const nb = [];
+      for (const d of DIRS) {
+        const nx = x + d[0], ny = y + d[1];
+        if (nx >= 0 && ny >= 0 && nx < cols && ny < rows && !vis[ny][nx]) nb.push([nx, ny, d]);
+      }
+      if (!nb.length) { stack.pop(); continue; }
+      const [nx, ny, d] = nb[Math.floor(Math.random() * nb.length)];
+      walls[y][x][d[2]] = 0; walls[ny][nx][d[3]] = 0;
+      vis[ny][nx] = 1; stack.push([nx, ny]);
+    }
+    // buka beberapa dinding agar ada jalur memutar
+    for (let i = 0, k = Math.floor(cols * rows * 0.07); i < k; i++) {
+      const x = Math.floor(Math.random() * cols), y = Math.floor(Math.random() * rows);
+      const d = DIRS[Math.floor(Math.random() * 4)];
+      const nx = x + d[0], ny = y + d[1];
+      if (nx >= 0 && ny >= 0 && nx < cols && ny < rows) { walls[y][x][d[2]] = 0; walls[ny][nx][d[3]] = 0; }
+    }
+    // rect dinding
+    rects = [];
+    const t = WALL_T;
+    for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+      const w = walls[y][x], px = x * CELL, py = y * CELL;
+      if (w[0]) rects.push([px - t/2, py - t/2, CELL + t, t]);
+      if (w[3]) rects.push([px - t/2, py - t/2, t, CELL + t]);
+      if (y === rows - 1 && w[2]) rects.push([px - t/2, py + CELL - t/2, CELL + t, t]);
+      if (x === cols - 1 && w[1]) rects.push([px + CELL - t/2, py - t/2, t, CELL + t]);
+    }
+
+    player = { x: CELL / 2, y: CELL / 2, r: CELL * 0.27 };
+
+    // posisi anjing: sekitar 55% jarak terjauh dari pemain
+    const d0 = bfs(0, 0);
+    let maxD = 0; d0.forEach(v => { if (v > maxD) maxD = v; });
+    const cand = [];
+    d0.forEach((v, i) => { if (Math.abs(v - maxD * 0.55) <= 1) cand.push(i); });
+    const pick = cand[Math.floor(Math.random() * cand.length)] || (cols * rows - 1);
+    dog = { x: (pick % cols + 0.5) * CELL, y: (Math.floor(pick / cols) + 0.5) * CELL };
+
+    time = 0; startDelay = 3; loseT = 0; hbPhase = 0; prevP = 0; repathT = 0; distMap = null;
+    dragging = false; pointer = null; dragOff = null;
+    lvlEl.textContent = 'LEVEL ' + level;
+    fit();
+  }
+
+  function bfs(cx, cy) {
+    const dist = new Int32Array(cols * rows).fill(-1);
+    const q = [cy * cols + cx]; dist[q[0]] = 0;
+    for (let h = 0; h < q.length; h++) {
+      const i = q[h], x = i % cols, y = (i / cols) | 0;
+      for (const d of DIRS) {
+        if (walls[y][x][d[2]]) continue;
+        const nx = x + d[0], ny = y + d[1];
+        if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+        const j = ny * cols + nx;
+        if (dist[j] < 0) { dist[j] = dist[i] + 1; q.push(j); }
+      }
+    }
+    return dist;
+  }
+
+  // ---------- Ukuran layar ----------
+  function fit() {
+    const st = document.getElementById('stage');
+    const aw = st.clientWidth, ah = st.clientHeight;
+    const sc = Math.min(aw / W, ah / H);
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const cw = Math.floor(W * sc), ch = Math.floor(H * sc);
+    cv.style.width = cw + 'px'; cv.style.height = ch + 'px';
+    cv.width = Math.round(cw * dpr); cv.height = Math.round(ch * dpr);
+    scale = cv.width / W;
+    buildCache();
+  }
+
+  function buildCache() {
+    cache = document.createElement('canvas');
+    cache.width = cv.width; cache.height = cv.height;
+    const c = cache.getContext('2d');
+    c.setTransform(scale, 0, 0, scale, 0, 0);
+    c.fillStyle = '#0c0c12'; c.fillRect(0, 0, W, H);
+    // lantai bergaris tipis
+    c.strokeStyle = 'rgba(255,255,255,.025)'; c.lineWidth = 1;
+    for (let x = 0; x <= cols; x++) { c.beginPath(); c.moveTo(x * CELL, 0); c.lineTo(x * CELL, H); c.stroke(); }
+    for (let y = 0; y <= rows; y++) { c.beginPath(); c.moveTo(0, y * CELL); c.lineTo(W, y * CELL); c.stroke(); }
+    c.shadowColor = '#d1121f'; c.shadowBlur = 10 * scale;
+    c.fillStyle = '#6b1a24';
+    for (const r of rects) c.fillRect(r[0], r[1], r[2], r[3]);
+    c.shadowBlur = 0; c.fillStyle = '#b52a3a';
+    for (const r of rects) {
+      if (r[2] > r[3]) c.fillRect(r[0], r[1] + r[3]/2 - 1, r[2], 2);
+      else c.fillRect(r[0] + r[2]/2 - 1, r[1], 2, r[3]);
+    }
+  }
+
+  // ---------- Fisika pemain ----------
+  function resolve() {
+    const r = player.r;
+    for (const [rx, ry, rw, rh] of rects) {
+      if (player.x < rx - r || player.x > rx + rw + r || player.y < ry - r || player.y > ry + rh + r) continue;
+      const cx = Math.max(rx, Math.min(player.x, rx + rw));
+      const cy = Math.max(ry, Math.min(player.y, ry + rh));
+      let dx = player.x - cx, dy = player.y - cy;
+      const d2 = dx*dx + dy*dy;
+      if (d2 < r * r) {
+        if (d2 > 1e-6) {
+          const d = Math.sqrt(d2), p = r - d;
+          player.x += dx / d * p; player.y += dy / d * p;
+        } else {
+          const l = player.x - rx, rr = rx + rw - player.x, tp = player.y - ry, bt = ry + rh - player.y;
+          const m = Math.min(l, rr, tp, bt);
+          if (m === l) player.x = rx - r; else if (m === rr) player.x = rx + rw + r;
+          else if (m === tp) player.y = ry - r; else player.y = ry + rh + r;
+        }
+      }
+    }
+  }
+  function movePlayer(mx, my) {
+    const steps = Math.max(1, Math.ceil(Math.hypot(mx, my) / (player.r * 0.4)));
+    for (let i = 0; i < steps; i++) { player.x += mx / steps; player.y += my / steps; resolve(); }
+  }
+
+  // ---------- Input ----------
+  function toWorld(e) {
+    const b = cv.getBoundingClientRect();
+    return { x: (e.clientX - b.left) / b.width * W, y: (e.clientY - b.top) / b.height * H };
+  }
+  cv.addEventListener('pointerdown', e => {
+    if (state !== 'play') return;
+    e.preventDefault();
+    cv.setPointerCapture(e.pointerId);
+    pointer = toWorld(e);
+    dragOff = { x: player.x - pointer.x, y: player.y - pointer.y };
+    dragging = true;
+  });
+  cv.addEventListener('pointermove', e => { if (dragging) { e.preventDefault(); pointer = toWorld(e); } });
+  const endDrag = () => { dragging = false; pointer = null; };
+  cv.addEventListener('pointerup', endDrag);
+  cv.addEventListener('pointercancel', endDrag);
+  cv.addEventListener('contextmenu', e => e.preventDefault());
+  document.addEventListener('contextmenu', e => e.preventDefault());
+  document.addEventListener('dragstart', e => e.preventDefault());
+  addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; if (e.key.startsWith('Arrow')) e.preventDefault(); });
+  addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+  let rz; addEventListener('resize', () => { clearTimeout(rz); rz = setTimeout(fit, 120); });
+
+  // ---------- Alur game ----------
+  function showOverlay(title, text, label) {
+    ov.querySelector('h1').textContent = title;
+    msg.textContent = text; btn.textContent = label;
+    ov.classList.remove('hidden');
+  }
+  btn.addEventListener('click', () => {
+    try {
+      if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+      if (actx.state === 'suspended') actx.resume();
+    } catch (_) {}
+    if (state === 'win') level++;
+    if (state !== 'ready' || !walls) setupLevel();
+    state = 'play'; ov.classList.add('hidden');
+  });
+
+  function lose() {
+    state = 'lose'; loseT = 0; dragging = false;
+    if (navigator.vibrate) navigator.vibrate([200, 80, 300]);
+    thump(1.6);
+  }
+  function win() {
+    state = 'win'; dragging = false;
+    showOverlay('KAMU SELAMAT!', 'Berhasil kabur dalam ' + time.toFixed(1) + ' detik. Anjingnya akan lebih cepat di level berikutnya.', 'LEVEL BERIKUTNYA');
+  }
+
+  // ---------- Update ----------
+  const heart = p => {
+    const b = (c, w) => Math.exp(-(((p - c) / w) ** 2));
+    return Math.min(1, b(0.08, 0.06) + 0.75 * b(0.28, 0.06));
+  };
+
+  function update(dt) {
+    // detak jantung anjing (makin dekat makin cepat)
+    const dd = Math.hypot(dog.x - player.x, dog.y - player.y);
+    const close = Math.max(0, Math.min(1, 1 - dd / (CELL * 8)));
+    hbPhase += dt * (1.4 + 2.6 * close);
+    const p = hbPhase % 1;
+    if (state === 'play') {
+      if (prevP < 0.08 && p >= 0.08) thump(1);
+      if (prevP < 0.28 && p >= 0.28) thump(0.7);
+    }
+    prevP = p;
+
+    if (state === 'lose') {
+      loseT += dt;
+      if (loseT > 1.1 && ov.classList.contains('hidden'))
+        showOverlay('TERTANGKAP!', 'Anjing pembunuh berhasil menangkapmu.', 'COBA LAGI');
+      return;
+    }
+    if (state !== 'play') return;
+
+    time += dt; tmEl.textContent = time.toFixed(1) + ' d';
+    const sp = CELL * 7;
+
+    // gerakan pemain
+    const kx = (keys['arrowright'] || keys['d'] ? 1 : 0) - (keys['arrowleft'] || keys['a'] ? 1 : 0);
+    const ky = (keys['arrowdown'] || keys['s'] ? 1 : 0) - (keys['arrowup'] || keys['w'] ? 1 : 0);
+    if (kx || ky) {
+      const l = Math.hypot(kx, ky);
+      movePlayer(kx / l * sp * 0.6 * dt, ky / l * sp * 0.6 * dt);
+    } else if (dragging && pointer) {
+      let tx = pointer.x + dragOff.x, ty = pointer.y + dragOff.y;
+      let vx = tx - player.x, vy = ty - player.y, d = Math.hypot(vx, vy);
+      const leash = CELL * 1.2;
+      if (d > leash) { tx = player.x + vx / d * leash; ty = player.y + vy / d * leash; dragOff = { x: tx - pointer.x, y: ty - pointer.y }; vx = tx - player.x; vy = ty - player.y; d = leash; }
+      if (d > 0.5) { const m = Math.min(d, sp * dt); movePlayer(vx / d * m, vy / d * m); }
+    }
+
+    // anjing mengejar
+    if (startDelay > 0) startDelay -= dt;
+    else {
+      repathT -= dt;
+      const pcx = Math.max(0, Math.min(cols - 1, Math.floor(player.x / CELL)));
+      const pcy = Math.max(0, Math.min(rows - 1, Math.floor(player.y / CELL)));
+      if (repathT <= 0 || !distMap) { distMap = bfs(pcx, pcy); repathT = 0.1; }
+      const dcx = Math.max(0, Math.min(cols - 1, Math.floor(dog.x / CELL)));
+      const dcy = Math.max(0, Math.min(rows - 1, Math.floor(dog.y / CELL)));
+      let tx = player.x, ty = player.y;
+      if (dcx !== pcx || dcy !== pcy) {
+        let best = distMap[dcy * cols + dcx], bx = -1, by = -1;
+        for (const d of DIRS) {
+          if (walls[dcy][dcx][d[2]]) continue;
+          const nx = dcx + d[0], ny = dcy + d[1];
+          if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+          const v = distMap[ny * cols + nx];
+          if (v >= 0 && v < best) { best = v; bx = nx; by = ny; }
+        }
+        if (bx >= 0) { tx = (bx + 0.5) * CELL; ty = (by + 0.5) * CELL; }
+      }
+      const ds = CELL * Math.min(2.8 + 0.35 * level + time * 0.02, 5.6);
+      const vx = tx - dog.x, vy = ty - dog.y, d = Math.hypot(vx, vy);
+      if (d > 0.1) { const m = Math.min(d, ds * dt); dog.x += vx / d * m; dog.y += vy / d * m; }
+    }
+
+    if (Math.hypot(dog.x - player.x, dog.y - player.y) < player.r + CELL * 0.45) { lose(); return; }
+    const ex = (cols - 0.5) * CELL, ey = (rows - 0.5) * CELL;
+    if (Math.hypot(player.x - ex, player.y - ey) < CELL * 0.4) win();
+  }
+
+  // ---------- Gambar ----------
+  function fallbackDog(s) {
+    const g = ctx;
+    g.fillStyle = '#4a2c14';
+    g.beginPath(); g.ellipse(-s*.34, -s*.28, s*.14, s*.26, -.35, 0, 7); g.fill();
+    g.beginPath(); g.ellipse( s*.34, -s*.28, s*.14, s*.26,  .35, 0, 7); g.fill();
+    g.fillStyle = '#9a6330'; g.beginPath(); g.arc(0, 0, s*.38, 0, 7); g.fill();
+    g.fillStyle = '#e2bf94'; g.beginPath(); g.ellipse(0, s*.12, s*.22, s*.18, 0, 0, 7); g.fill();
+    g.fillStyle = '#111'; g.beginPath(); g.ellipse(0, s*.03, s*.07, s*.05, 0, 0, 7); g.fill();
+    g.fillStyle = '#fff';
+    g.beginPath(); g.arc(-s*.14, -s*.08, s*.08, 0, 7); g.arc(s*.14, -s*.08, s*.08, 0, 7); g.fill();
+    g.fillStyle = '#e00';
+    g.beginPath(); g.arc(-s*.14, -s*.08, s*.045, 0, 7); g.arc(s*.14, -s*.08, s*.045, 0, 7); g.fill();
+    g.strokeStyle = '#2a1608'; g.lineWidth = s*.03;
+    g.beginPath(); g.moveTo(-s*.25, -s*.2); g.lineTo(-s*.06, -s*.12); g.moveTo(s*.25, -s*.2); g.lineTo(s*.06, -s*.12); g.stroke();
+    g.fillStyle = '#7a0010'; g.beginPath(); g.ellipse(0, s*.2, s*.15, s*.07, 0, 0, 7); g.fill();
+    g.fillStyle = '#fff';
+    for (const sx of [-1, 1]) { g.beginPath(); g.moveTo(sx*s*.09, s*.16); g.lineTo(sx*s*.04, s*.16); g.lineTo(sx*s*.065, s*.25); g.fill(); }
+  }
+
+  function drawDog(x, y, size, hb) {
+    ctx.save();
+    ctx.translate(x + (Math.random() - .5) * 2 * hb * 2, y + (Math.random() - .5) * 2 * hb * 2);
+    ctx.rotate((Math.random() - .5) * 0.05 * hb);
+    ctx.shadowColor = `rgba(255,20,20,${0.55 + 0.45 * hb})`;
+    ctx.shadowBlur = (22 + 30 * hb) * scale;
+    ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+    if (imgOK) {
+      const h = size, w = h * img.naturalWidth / img.naturalHeight;
+      try { ctx.filter = 'contrast(1.25) saturate(1.2) brightness(1.05)'; } catch (_) {}
+      ctx.drawImage(img, -w / 2, -h / 2, w, h);
+      ctx.filter = 'none';
+    } else fallbackDog(size);
+    ctx.restore();
+  }
+
+  function draw() {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(cache, 0, 0);
+    ctx.setTransform(scale, 0, 0, scale, 0, 0);
+    const hb = heart(hbPhase % 1);
+
+    // pintu keluar
+    const ex = (cols - 0.5) * CELL, ey = (rows - 0.5) * CELL;
+    ctx.save();
+    ctx.shadowColor = '#22ff66'; ctx.shadowBlur = 18 * scale;
+    ctx.fillStyle = '#1fbf55'; ctx.fillRect(ex - CELL*.3, ey - CELL*.34, CELL*.6, CELL*.68);
+    ctx.fillStyle = '#0b5a26'; ctx.fillRect(ex - CELL*.22, ey - CELL*.26, CELL*.44, CELL*.6);
+    ctx.fillStyle = '#ffe14d'; ctx.beginPath(); ctx.arc(ex + CELL*.1, ey + CELL*.05, 2.2, 0, 7); ctx.fill();
+    ctx.restore();
+
+    // pemain
+    ctx.save();
+    ctx.shadowColor = '#5cf'; ctx.shadowBlur = 14 * scale;
+    ctx.fillStyle = '#bfefff'; ctx.beginPath(); ctx.arc(player.x, player.y, player.r, 0, 7); ctx.fill();
+    ctx.shadowBlur = 0; ctx.fillStyle = '#123';
+    ctx.beginPath(); ctx.arc(player.x - player.r*.35, player.y - player.r*.15, player.r*.16, 0, 7);
+    ctx.arc(player.x + player.r*.35, player.y - player.r*.15, player.r*.16, 0, 7); ctx.fill();
+    ctx.restore();
+
+    // anjing (besar, jedag-jedug)
+    if (state === 'lose') {
+      const k = Math.min(loseT / 0.45, 1), e = 1 - Math.pow(1 - k, 3);
+      const base = CELL * 2.6 * (1 + 0.22 * hb), big = Math.min(W, H) * 1.15;
+      drawDog(dog.x + (W / 2 - dog.x) * e, dog.y + (H / 2 - dog.y) * e, base + (big - base) * e, hb);
+    } else {
+      drawDog(dog.x, dog.y, CELL * 2.6 * (1 + 0.22 * hb), hb);
+    }
+
+    // vignette berdenyut
+    const g = ctx.createRadialGradient(W/2, H/2, Math.min(W, H) * .3, W/2, H/2, Math.max(W, H) * .75);
+    g.addColorStop(0, 'rgba(120,0,0,0)');
+    g.addColorStop(1, `rgba(150,0,10,${0.18 + 0.35 * hb})`);
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+    if (state === 'play' && startDelay > 0) {
+      ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.font = `800 ${CELL * .75}px system-ui,sans-serif`;
+      ctx.shadowColor = '#000'; ctx.shadowBlur = 6;
+      ctx.fillText('LARI! Anjing bangun dalam ' + Math.ceil(startDelay), W / 2, H / 2);
+      ctx.shadowBlur = 0;
+    }
+  }
+
+  // ---------- Loop ----------
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(0.05, (now - last) / 1000); last = now;
+    update(dt); draw();
+    requestAnimationFrame(loop);
+  }
+  setupLevel();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
